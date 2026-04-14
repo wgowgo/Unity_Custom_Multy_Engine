@@ -1,0 +1,248 @@
+================================================================
+  MyNetEngine  —  소개 및 적용 방법
+  Unity 전용 네트워크 엔진 (Mirror API 호환 레이어 포함)
+================================================================
+
+[ 한줄 요약 ]
+Mirror의 쉬운 API + FishNet의 prediction + Fusion의 tick 시뮬레이션을
+합쳐서 새로 만든 Unity 네트워크 엔진.
+Mirror와 다른 점은 내부 구조 전체를 새로 짰다는 것.
+
+
+================================================================
+  1. 이게 뭔지
+================================================================
+
+■ 핵심 특징
+  - Tick 기반 시뮬레이션 (기본 30tick. 60tick 변경 가능)
+  - KCP reliable UDP 탑재 (ARQ 재전송 보장)
+  - Delta snapshot + Dirty tracking (바뀐 값만 전송)
+  - 서버 권한(Server Authoritative) 기본
+  - Owner Prediction + 서버 Reconciliation
+  - AOI (Area of Interest): 범위 밖 오브젝트는 전송 안 함
+  - 우선순위 기반 전송 (owner > 근거리 > 미전송 오래된 것)
+  - GC 최소화: ArrayPool, struct 기반 메시지, boxing 없음
+  - Quaternion 압축 (32bit), 위치 양자화 (16bit)
+  - Mirror 이름 호환 레이어: [SyncVar], [Command], [ClientRpc] 그대로 써도 됨
+
+
+■ 계층 구조 (요약)
+  ┌─ NetworkRunnerBehaviour  ← Unity 씬 컴포넌트 (진입점)
+  │   └─ NetworkRunner       ← 서버/클라 lifecycle 관리
+  ├─ Transport               ← KCP / UDP / WebSocket
+  ├─ Tick                    ← 30tick/60tick 고정 시뮬
+  ├─ Replication             ← Snapshot 생성·전송·우선순위
+  ├─ Prediction              ← InputBuffer + Reconcile
+  ├─ Interest                ← SpatialHash + 팀/씬 필터
+  ├─ Objects                 ← NetworkObject, NetBehaviour, SpawnManager
+  ├─ Messaging               ← RPC, MessageRouter
+  └─ Compatibility           ← MirrorAdapter (기존 Mirror 코드 호환)
+
+
+================================================================
+  2. 적용 방법 (단계별)
+================================================================
+
+─────────────────────────────────────────
+  STEP 1. 폴더 복사
+─────────────────────────────────────────
+"Uity Multy Engine" 폴더 전체를 Unity 프로젝트 Assets 아래에 복사.
+
+  Assets/
+    MyNetEngine/      ← 여기에 붙여넣기
+      Runtime/
+      Editor/
+      Compatibility/
+      Samples/
+
+asmdef 파일이 포함되어 있어 Unity가 자동으로 컴파일한다.
+
+
+─────────────────────────────────────────
+  STEP 2. 씬에 진입 컴포넌트 추가
+─────────────────────────────────────────
+빈 GameObject 생성 → Add Component → NetworkRunnerBehaviour
+
+Inspector 설정:
+  Mode        : Server / Client / Host 중 선택
+  Host        : 클라이언트일 때 접속할 서버 IP (예: 127.0.0.1)
+  Port        : 7777 (기본)
+  TickRate    : 30 (기본. 60 권장 시 변경)
+  Kind        : KCP (권장) / UdpLite (테스트) / WebSocket (WebGL)
+  AoiRadius   : 60 (AOI 반경 m. 이 범위 밖 오브젝트는 안 보냄)
+  BudgetPerTickPerConn : 8192 (tick당 연결별 최대 전송 바이트)
+
+
+─────────────────────────────────────────
+  STEP 3. Prefab 등록
+─────────────────────────────────────────
+NetworkRunnerBehaviour Inspector → "Network Prefabs" 리스트:
+  - Hash  : 임의의 고유 uint 숫자. 서버/클라 반드시 동일해야 함.
+  - Prefab: 스폰할 GameObject Prefab
+
+예시:
+  Hash=1001  Prefab=PlayerPrefab
+  Hash=1002  Prefab=EnemyPrefab
+
+주의: Hash 중복 불가. 코드에서 수동 지정하거나
+  uint hash = (uint)"Player".GetHashCode(); 같이 계산.
+
+
+─────────────────────────────────────────
+  STEP 4. 스크립트 작성 (기본 API)
+─────────────────────────────────────────
+using MyNetEngine.Objects;
+using MyNetEngine.Core.Serialization;
+
+public class PlayerNet : NetBehaviour
+{
+    // 동기화할 값
+    public int Hp = 100;
+    private bool _dirty;
+
+    // 직렬화 (서버 → 클라 전송)
+    public override bool IsDirty() => _dirty;
+    public override void ClearDirty() => _dirty = false;
+
+    public override void Serialize(NetWriter w, bool isInitial)
+    {
+        w.WriteVarInt(Hp);
+    }
+
+    public override void Deserialize(NetReader r, bool isInitial)
+    {
+        Hp = r.ReadVarInt();
+    }
+
+    // 데미지 처리 (서버에서만 호출)
+    public void TakeDamage(int dmg)
+    {
+        if (!IsServer) return;
+        Hp -= dmg;
+        _dirty = true;  // 다음 tick에 자동 전송됨
+    }
+}
+
+
+─────────────────────────────────────────
+  STEP 5. 서버에서 오브젝트 스폰
+─────────────────────────────────────────
+var runner = FindObjectOfType<NetworkRunnerBehaviour>();
+
+// 서버에서 Player 스폰 (ownerConnId는 해당 클라이언트 연결 ID)
+runner.SpawnObject(
+    prefabHash: 1001,
+    ownerConnId: connId,
+    authority: AuthorityMode.OwnerPredictedServerValidated,
+    pos: new Vector3(0, 0, 0)
+);
+
+스폰 시 자동으로:
+  - 서버: NetworkObject 생성, Interest 등록, 클라이언트에 Spawn 메시지 전송
+  - 클라: 동일 prefabHash로 Prefab Instantiate, 상태 수신 대기
+
+
+─────────────────────────────────────────
+  STEP 6. 고급 — Prediction (움직임 예측)
+─────────────────────────────────────────
+using MyNetEngine.Unity;
+
+// PredictedController를 상속 (내장 kinematic 모터)
+public class MyController : PredictedController
+{
+    // MoveSpeed, JumpSpeed, Gravity, GroundY 필드 Inspector에서 조정
+    // 위치 예측/보정이 자동으로 동작함
+}
+
+또는 완전 커스텀:
+public class MyPredicted : PredictedBehaviour<MyInput, MyState>
+{
+    protected override void Simulate(ref MyInput input, ref MyState state, float dt)
+    {
+        // 서버/클라 동일한 로직
+    }
+    protected override bool NeedsReconcile(in MyState serverState, in MyState predictedState)
+    {
+        // 오차 임계값 판정
+        return Vector3.Distance(...) > 0.1f;
+    }
+}
+
+
+─────────────────────────────────────────
+  STEP 7. SyncProperty 자동화 (Source Generator)
+─────────────────────────────────────────
+Serialize/Deserialize/IsDirty를 손으로 쓰기 싫으면:
+
+① 빌드:
+  cd SourceGenerator~/MyNetEngine.SourceGen
+  dotnet build -c Release
+  → 출력된 DLL을 Assets/MyNetEngine/Plugins/에 복사
+  → Inspector에서 RoslynAnalyzer 레이블 추가
+
+② 사용:
+  public partial class PlayerNet : NetBehaviour   // partial 필수
+  {
+      [SyncProperty(Priority = 5)] private int hp;
+      [SyncProperty] private float posX;
+
+      // 값 쓸 때는 Sync_ 프로퍼티로:
+      // Sync_hp = 100;   ← 이러면 dirty 자동 설정
+  }
+  Serialize/Deserialize/IsDirty/ClearDirty 전부 자동 생성됨.
+
+
+─────────────────────────────────────────
+  STEP 8. Mirror 코드 마이그레이션
+─────────────────────────────────────────
+기존 Mirror 코드가 있다면:
+  - using 교체:
+      using Mirror → using MyNetEngine.Compatibility.Mirror
+  - NetworkBehaviour 상속은 그대로 동작
+  - [SyncVar], [Command], [ClientRpc], [TargetRpc] attribute 그대로 동작
+  - NetworkServer.Spawn 등 Mirror 전용 static API는 NetworkRunner로 교체 필요
+
+
+================================================================
+  3. Editor 도구
+================================================================
+
+Unity 메뉴 → MyNetEngine
+
+  Bandwidth Profiler : 연결별/오브젝트별/RPC별 전송량 확인
+  Tick Graph         : tick 주기, interpolation alpha 시각화 (확장 예정)
+  SyncVar Analyzer   : NetBehaviour 상속 클래스의 SyncProperty 필드 통계
+
+
+================================================================
+  4. 주요 파일 목록
+================================================================
+
+  Runtime/NetworkRunner.cs              서버/클라 lifecycle 핵심
+  Runtime/Core/Tick/NetworkTickSystem   tick 루프
+  Runtime/Core/Serialization/NetWriter  직렬화 (varint, quantize 등)
+  Runtime/Transport/Kcp/Kcp.cs         KCP ARQ 알고리즘 (ikcp.c 포팅)
+  Runtime/Transport/KcpTransport.cs    KCP + raw UDP 통합 transport
+  Runtime/Replication/ReplicationManager  snapshot 생성·전송
+  Runtime/Prediction/PredictedBehaviour   owner prediction + reconcile
+  Runtime/Interest/SpatialHashGrid     AOI 공간 분할
+  Runtime/Unity/NetworkRunnerBehaviour Unity Inspector 진입점
+  Runtime/Unity/PredictedController   Tier1 kinematic 예측 모터
+  Compatibility/MirrorAdapter.cs      Mirror API 이름 호환
+  SourceGenerator~/                   Roslyn Source Generator
+  DESIGN.md                           설계 철학 + 로드맵
+
+
+================================================================
+  5. 알려진 제한 / TODO
+================================================================
+
+  - KcpTransport: 현재 단일 conv(연결 ID=convId). 멀티 클라이언트
+    서버 시 conv 관리 완성 필요.
+  - Host 모드: 루프백 short-circuit 미구현 (로그만 출력).
+  - Source Generator: Unity 2021.2+ 필요 (Roslyn Analyzer 지원).
+  - Physics rollback (Tier3): 미구현. Unity physics scene 복수 필요.
+  - Room/Lobby/Matchmaking: 미구현.
+  - WebSocketTransport: stub 상태. NativeWebSocket 연결 필요.
+
+================================================================
