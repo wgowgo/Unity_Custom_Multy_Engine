@@ -369,7 +369,7 @@ Unity menu → **MyNetEngine**
 
 ---
 
-## Roadmap & Known Limitations
+## Roadmap
 
 | Item | Status |
 |------|--------|
@@ -758,7 +758,7 @@ Unity 메뉴 → **MyNetEngine**
 
 ---
 
-## 로드맵 및 알려진 제한
+## 로드맵
 
 | 항목 | 상태 |
 |------|------|
